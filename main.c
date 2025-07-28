@@ -90,52 +90,76 @@ int main(int argc, char const *argv[])
 
 void handle_request(int sock)
 {
-    // 为了方便观察，我们在输出中加入进程ID (PID)
     printf("Child process PID: %d is handling a request.\n", getpid());
     
     char buffer[2048] = {0};
     char method[16], uri[256];
-    char filepath[512];
     
     read(sock, buffer, 2048);
     sscanf(buffer, "%s %s", method, uri);
     printf("PID: %d, Method: %s, URI: %s\n", getpid(), method, uri);
 
-    if (strcmp(method, "GET") != 0) {
-        char *response = "HTTP/1.1 501 Not Implemented\n\n";
-        write(sock, response, strlen(response));
-        return;
+    // CGI 处理逻辑
+    if (strncmp(uri, "/cgi-bin/", 9) == 0) // 确保是CGI请求
+    { 
+        char cgi_path[512];
+        sprintf(cgi_path, ".%s", uri);
+
+        // HTTP 状态行
+        char *status_line = "HTTP/1.1 200 OK\n";
+        write(sock, status_line, strlen(status_line));
+
+        // stdout  ->  客户端 socket
+        if (dup2(sock, STDOUT_FILENO) == -1)
+        {
+            perror("dup2 failed");
+            exit(EXIT_FAILURE);
+        }
+
+        // execl 执行 CGI 程序
+        if (execl(cgi_path, cgi_path, NULL) < 0)
+        {
+            perror("execl failed");
+            exit(EXIT_FAILURE);
+        }
+
     }
-
-    char* request_uri = uri;
-    if (strcmp(request_uri, "/") == 0) {
-        request_uri = "/index.html";
-    }
-
-    sprintf(filepath, "htdocs%s", request_uri);
-
-    FILE *file = fopen(filepath, "r");
-    if (file == NULL) {
-        printf("PID: %d, File not found: %s\n", getpid(), filepath);
-        char *response = "HTTP/1.1 404 Not Found\nContent-Type: text/html\n\n<h1>404 Not Found</h1>";
-        write(sock, response, strlen(response));
-    } else {
-        printf("PID: %d, Serving file: %s\n", getpid(), filepath);
+    else 
+    {
+        //  处理静态文件
+        if (strcmp(method, "GET") != 0) 
+        { 
+            char *response = "HTTP/1.1 501 Not Implemented\n\n";
+            write(sock, response, strlen(response));
+            return; 
+        }
+        char* request_uri = uri;
+        if (strcmp(request_uri, "/") == 0) { request_uri = "/index.html"; }
         
-        struct stat st;
-        stat(filepath, &st);
-        long file_size = st.st_size;
+        char filepath[512];
+        sprintf(filepath, "htdocs%s", request_uri);
 
-        char *file_content = malloc(file_size);
-        fread(file_content, 1, file_size, file);
-        fclose(file);
-
-        char response_header[256];
-        sprintf(response_header, "HTTP/1.1 200 OK\nContent-Type: text/html\nContent-Length: %ld\n\n", file_size);
-        write(sock, response_header, strlen(response_header));
-        
-        write(sock, file_content, file_size);
-        
-        free(file_content);
+        FILE *file = fopen(filepath, "r");
+        if (file == NULL) 
+        {
+            printf("PID: %d, File not found: %s\n", getpid(), filepath);
+            char *response = "HTTP/1.1 404 Not Found\nContent-Type: text/html\n\n<h1>404 Not Found</h1>";
+            write(sock, response, strlen(response));
+        } 
+        else 
+        {
+            printf("PID: %d, Serving file: %s\n", getpid(), filepath);
+            struct stat st;
+            stat(filepath, &st);
+            long file_size = st.st_size;
+            char *file_content = malloc(file_size);
+            fread(file_content, 1, file_size, file);
+            fclose(file);
+            char response_header[256];
+            sprintf(response_header, "HTTP/1.1 200 OK\nContent-Type: text/html\nContent-Length: %ld\n\n", file_size);
+            write(sock, response_header, strlen(response_header));
+            write(sock, file_content, file_size);
+            free(file_content);
+        }
     }
 }
