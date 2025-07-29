@@ -9,8 +9,10 @@
 #include <signal.h>   // for signal()
 
 #define PORT 8080
+#define POOL_SIZE 8
 
 void handle_request(int sock);
+void start_worker(int server_fd);
 
 void sigchld_handler(int sig)
 {
@@ -21,7 +23,7 @@ int main(int argc, char const *argv[])
 {
     int server_fd, new_socket;
     struct sockaddr_in address;
-    int addrlen = sizeof(address);
+    // int addrlen = sizeof(address);
 
     // --- 注册信号处理器 ---
     // 当子进程状态改变(如退出)时，调用 sigchld_handler
@@ -41,56 +43,67 @@ int main(int argc, char const *argv[])
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         perror("bind failed"); exit(EXIT_FAILURE);
     }
-    if (listen(server_fd, 10) < 0) {
+    if (listen(server_fd, 20) < 0) {
         perror("listen"); exit(EXIT_FAILURE);
     }
 
-    printf("--- Server is listening on port %d (Multi-Process Mode) ---\n", PORT);
+    printf("--- Server starting with a process pool of size %d ---\n", POOL_SIZE);
 
-    while (1)
+    // 创建进程池
+    for (int i=0; i < POOL_SIZE; i ++)
     {
-        if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
-            perror("accept");
-            continue; 
-        }
-
         pid_t pid = fork();
-
-        if (pid < 0)
-        {
-            perror("fork");
-            close(new_socket);
-            continue;   
-        }
-
         if (pid == 0)
         {
-            // 子进程
-            close(server_fd);
-
-            handle_request(new_socket);
-
-            close(new_socket);
-
-            printf("Child process PID: %d finished.\n", getpid());
+            start_worker(server_fd);  // 子进程进入工作循环，不再返回
             exit(0);
         }
-        else
-        {
-            // 父
-            close(new_socket);
-
-            // 直接关闭，等待下一个连接
-        }
+        if (pid < 0) perror("fork to create pool failed");
     }
+
+    // 父进程（主进程）的职责是维持运行，等待子进程（理论上是无限等待）
+    wait(NULL);
 
     close(server_fd);
     return 0;
 }
 
+/**
+ * @brief 工作进程的入口函数，包含一个无限循环
+ * @param server_fd 服务器的监听socket
+ */
+void start_worker(int server_fd)
+{
+    int new_socket;
+    struct sockaddr_in address;
+    int addrlen = sizeof(address);
+
+    printf("Worker PID %d started.\n", getpid());
+
+    while (1)
+    {
+        // 所有工作进程都阻塞在这里，等待内核唤醒来处理新连接
+        new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
+        if (new_socket < 0) {
+            perror("accept in worker");
+            continue;
+        }
+
+        handle_request(new_socket);
+
+        close(new_socket);
+    }
+}
+
+/**
+ * @brief 处理CGI的"孙子进程"逻辑
+ * @param sock 连接的客户端socket
+ */
+
+ // why 孙子进程 ？  健壮性 & 隔离性： 把孙子进程视为“沙盒” 隔离了CGI的执行风险
 void handle_request(int sock)
 {
-    printf("Child process PID: %d is handling a request.\n", getpid());
+    printf("Worker PID %d is handling a request on socket %d.\n", getpid(), sock);
     
     char buffer[2048] = {0};
     char method[16], uri[256];
@@ -102,27 +115,39 @@ void handle_request(int sock)
     // CGI 处理逻辑
     if (strncmp(uri, "/cgi-bin/", 9) == 0) // 确保是CGI请求
     { 
-        char cgi_path[512];
-        sprintf(cgi_path, ".%s", uri);
+        pid_t cgi_pid = fork();
 
-        // HTTP 状态行
-        char *status_line = "HTTP/1.1 200 OK\n";
-        write(sock, status_line, strlen(status_line));
-
-        // stdout  ->  客户端 socket
-        if (dup2(sock, STDOUT_FILENO) == -1)
+         if (cgi_pid < 0) {
+            perror("fork for cgi failed");
+            return;
+        }
+        
+        if (cgi_pid == 0)
         {
-            perror("dup2 failed");
-            exit(EXIT_FAILURE);
+            char cgi_path[512];
+            sprintf(cgi_path, ".%s", uri);
+
+            // HTTP 状态行
+            char *status_line = "HTTP/1.1 200 OK\n";
+            write(sock, status_line, strlen(status_line));
+
+            // stdout  ->  客户端 socket
+            if (dup2(sock, STDOUT_FILENO) == -1)
+            {
+                perror("dup2 failed");
+                exit(EXIT_FAILURE);
+            }
+
+            // execl 执行 CGI 程序
+            if (execl(cgi_path, cgi_path, NULL) < 0)
+            {
+                perror("execl failed");
+                exit(EXIT_FAILURE);
+            }
         }
 
-        // execl 执行 CGI 程序
-        if (execl(cgi_path, cgi_path, NULL) < 0)
-        {
-            perror("execl failed");
-            exit(EXIT_FAILURE);
-        }
-
+        waitpid(cgi_pid, NULL, 0);
+        printf("Worker PID %d finished CGI request.\n", getpid());
     }
     else 
     {
@@ -162,4 +187,4 @@ void handle_request(int sock)
             free(file_content);
         }
     }
-}
+} 
